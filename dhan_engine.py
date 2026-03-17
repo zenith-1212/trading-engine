@@ -358,26 +358,37 @@ class TokenMapper:
     # ── CSV build ─────────────────────────────────────────────
 
     async def build_from_csv(self):
-        """Download and parse Dhan instrument master CSV."""
-        log.info("[MAP] Downloading Dhan instrument CSV...")
+        """
+        Download and parse Dhan instrument master CSV.
+        Safe to call multiple times — clears old data before rebuilding
+        so stale expiries from yesterday are removed.
+        """
+        log.info("[MAP] Downloading Dhan instrument CSV (fresh daily copy)...")
         for attempt in range(1, 5):
             try:
                 async with httpx.AsyncClient(
-                    timeout=120,
+                    timeout=180,
                     headers={"User-Agent": "Mozilla/5.0"},
                 ) as client:
                     resp = await client.get(DHAN_CSV_URL)
                     resp.raise_for_status()
                 text = resp.content.decode("utf-8", errors="ignore")
+                # Clear old data before parsing — removes expired contracts
+                self._sid_to_meta.clear()
+                self._key_to_sid.clear()
+                self._trd_to_sid.clear()
+                self._psym_to_sid.clear()
+                self._sid_to_trd.clear()
+                self._nei.clear()
                 self._parse_csv(text)
                 log.info(f"[MAP] ✓ CSV loaded — {len(self._key_to_sid)} FO instruments")
                 self.csv_loaded = True
                 return
             except Exception as e:
-                wait = attempt * 10
-                log.warning(f"[MAP] CSV attempt {attempt} failed: {e} — retry in {wait}s")
+                wait = attempt * 15
+                log.warning(f"[MAP] CSV attempt {attempt}/4 failed: {e} — retry in {wait}s")
                 await asyncio.sleep(wait)
-        log.error("[MAP] All CSV download attempts failed")
+        log.error("[MAP] All CSV download attempts failed — mapper may be stale")
 
     def _parse_csv(self, text: str):
         reader = csv.DictReader(io.StringIO(text))
@@ -856,6 +867,12 @@ class DhanEngine:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
+    def mapper_ready(self) -> bool:
+        """Called by /health — is the Dhan CSV loaded?"""        return self._mapper.csv_loaded
+
+    def ws_connected(self) -> bool:
+        """Called by /health — is the WebSocket connected?"""        return self._ws_running
+
     def get_ltp(self, token: str) -> Optional[float]:
         return self._prices.get(token)
 
@@ -944,18 +961,62 @@ class DhanEngine:
         return False
 
     async def _daily_refresh_loop(self):
-        """Refresh Dhan token every day at 08:00 AM IST."""
+        """
+        Every day at 08:00 AM IST:
+          1. Refresh Dhan access token (TOTP-based)
+          2. Re-download Dhan instrument CSV  ← CRITICAL: new weekly expiries appear daily
+          3. Re-enrich token mapper with fresh instrument data
+          4. Re-subscribe all active tokens with updated security_ids
+
+        Why CSV must be re-downloaded daily:
+          - New weekly options are added every Thursday
+          - Expired contracts are removed
+          - Security IDs can change for rolled contracts
+          Without this, the mapper goes stale and option LTPs stop working
+          after the first expiry day.
+        """
         while not self._stop:
             now = datetime.now()
             target = now.replace(hour=8, minute=0, second=0, microsecond=0)
             if target <= now:
                 target += timedelta(days=1)
             wait = (target - now).total_seconds()
-            log.info(f"[TOKEN] Next auto-refresh at {target.strftime('%d-%b %H:%M')} ({wait/3600:.1f}h)")
+            log.info(f"[DAILY] Next refresh at {target.strftime('%d-%b %H:%M')} ({wait/3600:.1f}h)")
             await asyncio.sleep(wait)
-            if not self._stop:
-                log.info("[TOKEN] 08:00 AM — running daily token refresh...")
-                await self._do_token_refresh()
+            if self._stop:
+                break
+
+            log.info("[DAILY] 08:00 AM — starting daily refresh sequence...")
+
+            # Step 1: Refresh Dhan access token
+            log.info("[DAILY] Step 1/3 — Refreshing Dhan access token...")
+            token_ok = await self._do_token_refresh()
+            log.info(f"[DAILY] Token refresh: {'✓ OK' if token_ok else '✗ FAILED (using existing)'}")
+
+            # Step 2: Re-download Dhan instrument CSV (fresh expiries for today)
+            log.info("[DAILY] Step 2/3 — Re-downloading Dhan instrument CSV...")
+            try:
+                old_count = len(self._mapper._key_to_sid)
+                await self._mapper.build_from_csv()
+                new_count = len(self._mapper._key_to_sid)
+                log.info(f"[DAILY] CSV refreshed: {old_count} → {new_count} instruments")
+            except Exception as e:
+                log.error(f"[DAILY] CSV re-download failed: {e} — keeping old mapper")
+
+            # Step 3: Re-subscribe all active tokens with fresh security_ids
+            # (some security_ids may have changed for rolled contracts)
+            log.info("[DAILY] Step 3/3 — Re-subscribing active tokens...")
+            if self._subscribed_sids:
+                log.info(f"[DAILY] Re-subscribing {len(self._subscribed_sids)} tokens...")
+                # Force reconnect so server gets fresh subscriptions
+                if self._ws and self._ws_running:
+                    try:
+                        await self._ws.close()
+                    except Exception:
+                        pass
+                # The ws_lifecycle will reconnect and re-subscribe automatically
+            
+            log.info("[DAILY] ✓ Daily refresh sequence complete")
 
     # ── Spot price poller (fallback if WS index ticks missing) ────────────────
 

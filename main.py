@@ -1,34 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║              HYBRID TRADING SYSTEM — CENTRAL DATA ENGINE                   ║
-║              Cloud Backend  (FastAPI + Single Dhan WebSocket)               ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-PURPOSE
--------
-  • Runs ONE Dhan WebSocket connection on a free cloud server (Railway / Fly.io)
-  • Receives live ticks and stores LTP in memory (lightning-fast)
-  • Exposes a REST + SSE API so desktop app + mobile app fetch data from HERE
-    instead of each opening their own Dhan WebSocket
-  • Auto-reconnects, re-subscribes, and refreshes the Dhan token daily
-
-ENDPOINTS
----------
-  GET  /health                     — liveness probe (Railway/Fly.io)
-  GET  /status                     — connection status + subscribed count
-  GET  /ltp/{token}                — single LTP by Kotak pSymbol or trd_symbol
-  POST /ltp/batch                  — bulk LTP lookup  { "tokens": [...] }
-  GET  /spot                       — NIFTY / BANKNIFTY / SENSEX spot prices
-  POST /subscribe                  — add tokens to live subscription
-  POST /unsubscribe                — remove tokens
-  GET  /stream                     — Server-Sent Events price stream (SSE)
-  POST /token/refresh              — force Dhan token refresh
-  GET  /chain/{symbol}/{expiry}    — option chain LTPs for a symbol+expiry
-
-DEPLOYMENT
-----------
-  Railway / Fly.io / Render — see DEPLOYMENT_GUIDE.md
+main.py — Hybrid Trading Cloud Engine
+FastAPI server with single Dhan WebSocket + REST/SSE price API
 """
 
 from __future__ import annotations
@@ -46,7 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-# ── Internal modules ──────────────────────────────────────────────────────────
 from dhan_engine import DhanEngine
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -57,51 +29,52 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-# ── Global engine instance ────────────────────────────────────────────────────
+# ── Globals ───────────────────────────────────────────────────────────────────
 engine: Optional[DhanEngine] = None
-
-# ── SSE subscriber queues ─────────────────────────────────────────────────────
-# Each connected SSE client gets a queue. Engine pushes ticks → all queues.
 _sse_clients: Set[asyncio.Queue] = set()
 _sse_lock = asyncio.Lock()
+_startup_time = time.time()
 
 
-# ── Lifespan (startup / shutdown) ────────────────────────────────────────────
-
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine
-    log.info("═" * 60)
-    log.info("  Hybrid Trading Cloud Engine  —  STARTING")
-    log.info("═" * 60)
+    log.info("=" * 60)
+    log.info("  Hybrid Trading Cloud Engine — STARTING")
+    log.info(f"  PORT = {os.environ.get('PORT', '8000')}")
+    log.info("=" * 60)
 
+    # Engine starts background tasks (CSV download, WS connect)
+    # These are NON-BLOCKING so /health responds immediately
     engine = DhanEngine(sse_broadcast_fn=_broadcast_tick)
     await engine.start()
 
-    yield  # ← server is running here
+    log.info("[STARTUP] Engine tasks launched — /health is now responding")
+    log.info("[STARTUP] CSV download will complete in ~60-120s in background")
 
-    log.info("Shutting down engine...")
+    yield  # server live here
+
+    log.info("Shutting down...")
     await engine.stop()
 
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Hybrid Trading Engine",
-    description="Central Dhan WebSocket + price cache server",
     version="2.0.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in production if needed
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
-
 class BatchLtpRequest(BaseModel):
     tokens: List[str]
 
@@ -112,10 +85,8 @@ class TokenRefreshRequest(BaseModel):
     force: bool = False
 
 
-# ── SSE broadcast helper ──────────────────────────────────────────────────────
-
+# ── SSE broadcast ─────────────────────────────────────────────────────────────
 async def _broadcast_tick(token: str, ltp: float):
-    """Called by DhanEngine on every price tick — pushes to all SSE clients."""
     if not _sse_clients:
         return
     payload = json.dumps({"t": token, "p": round(ltp, 2)})
@@ -134,21 +105,32 @@ async def _broadcast_tick(token: str, ltp: float):
 
 @app.get("/health")
 async def health():
-    """Railway / Fly.io health probe — must return 200."""
-    return {"ok": True, "ts": int(time.time())}
+    """
+    Railway health probe.
+    Returns 200 immediately — even before CSV loads or WS connects.
+    uptime_seconds shows how long the server has been running.
+    """
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "uptime_seconds": int(time.time() - _startup_time),
+        "engine_ready": engine is not None,
+        "mapper_ready": engine.mapper_ready() if engine else False,
+        "ws_connected": engine.ws_connected() if engine else False,
+    }
 
 
 @app.get("/status")
 async def status():
     if not engine:
-        return {"connected": False}
+        return {"connected": False, "startup": "in_progress"}
     return engine.get_status()
 
 
 @app.get("/ltp/{token}")
 async def get_ltp(token: str):
     if not engine:
-        raise HTTPException(503, "Engine not ready")
+        raise HTTPException(503, "Engine starting up, try again in 30 seconds")
     ltp = engine.get_ltp(token)
     if ltp is None:
         raise HTTPException(404, f"No price for token: {token}")
@@ -158,7 +140,7 @@ async def get_ltp(token: str):
 @app.post("/ltp/batch")
 async def get_ltp_batch(req: BatchLtpRequest):
     if not engine:
-        raise HTTPException(503, "Engine not ready")
+        raise HTTPException(503, "Engine starting up")
     result: Dict[str, Optional[float]] = {}
     for tok in req.tokens:
         result[tok] = engine.get_ltp(tok)
@@ -167,16 +149,15 @@ async def get_ltp_batch(req: BatchLtpRequest):
 
 @app.get("/spot")
 async def get_spot():
-    """Returns NIFTY / BANKNIFTY / SENSEX spot prices."""
     if not engine:
-        raise HTTPException(503, "Engine not ready")
+        raise HTTPException(503, "Engine starting up")
     return engine.get_spot_prices()
 
 
 @app.post("/subscribe")
 async def subscribe(req: SubscribeRequest):
     if not engine:
-        raise HTTPException(503, "Engine not ready")
+        raise HTTPException(503, "Engine starting up")
     await engine.subscribe_tokens(req.tokens)
     return {"subscribed": len(req.tokens), "total": engine.subscribed_count()}
 
@@ -184,20 +165,15 @@ async def subscribe(req: SubscribeRequest):
 @app.post("/unsubscribe")
 async def unsubscribe(req: SubscribeRequest):
     if not engine:
-        raise HTTPException(503, "Engine not ready")
+        raise HTTPException(503, "Engine starting up")
     await engine.unsubscribe_tokens(req.tokens)
     return {"unsubscribed": len(req.tokens)}
 
 
 @app.get("/chain/{symbol}/{expiry}")
 async def get_chain(symbol: str, expiry: str):
-    """
-    Return all LTPs for option chain rows matching the given symbol & expiry.
-    symbol: NIFTY | BANKNIFTY | SENSEX
-    expiry: YYYY-MM-DD
-    """
     if not engine:
-        raise HTTPException(503, "Engine not ready")
+        raise HTTPException(503, "Engine starting up")
     chain = engine.get_chain_ltps(symbol.upper(), expiry)
     return {"symbol": symbol, "expiry": expiry, "chain": chain}
 
@@ -205,7 +181,7 @@ async def get_chain(symbol: str, expiry: str):
 @app.post("/token/refresh")
 async def force_token_refresh(req: TokenRefreshRequest):
     if not engine:
-        raise HTTPException(503, "Engine not ready")
+        raise HTTPException(503, "Engine starting up")
     success = await engine.refresh_dhan_token(force=req.force)
     return {"success": success}
 
@@ -213,16 +189,14 @@ async def force_token_refresh(req: TokenRefreshRequest):
 @app.get("/stream")
 async def sse_stream(request: Request):
     """
-    Server-Sent Events endpoint.
-    Clients connect once; they receive every price tick in real time.
-    Format:  data: {"t":"NIFTY2631722500CE","p":120.50}\n\n
+    Server-Sent Events — real-time price ticks to all connected clients.
+    Format: data: {"t":"NIFTY2631722500CE","p":120.50}
     """
     queue: asyncio.Queue = asyncio.Queue(maxsize=500)
     async with _sse_lock:
         _sse_clients.add(queue)
 
     async def event_generator() -> AsyncGenerator[str, None]:
-        # Send connection confirmation
         yield f"data: {json.dumps({'type':'connected','ts':int(time.time())})}\n\n"
         try:
             while True:
@@ -232,7 +206,6 @@ async def sse_stream(request: Request):
                     payload = await asyncio.wait_for(queue.get(), timeout=15.0)
                     yield f"data: {payload}\n\n"
                 except asyncio.TimeoutError:
-                    # Send keepalive comment every 15s so proxies don't close the connection
                     yield ": keepalive\n\n"
         finally:
             async with _sse_lock:
@@ -243,7 +216,7 @@ async def sse_stream(request: Request):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx buffering
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -251,4 +224,5 @@ async def sse_stream(request: Request):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
+    log.info(f"Starting on port {port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")

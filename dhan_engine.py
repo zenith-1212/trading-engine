@@ -868,10 +868,12 @@ class DhanEngine:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def mapper_ready(self) -> bool:
-        """Called by /health — is the Dhan CSV loaded?"""        return self._mapper.csv_loaded
+        """Called by /health — is the Dhan CSV loaded?"""
+        return self._mapper.csv_loaded
 
     def ws_connected(self) -> bool:
-        """Called by /health — is the WebSocket connected?"""        return self._ws_running
+        """Called by /health — is the WebSocket connected?"""
+        return self._ws_running
 
     def get_ltp(self, token: str) -> Optional[float]:
         return self._prices.get(token)

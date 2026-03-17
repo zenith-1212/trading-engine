@@ -1,0 +1,26 @@
+app = "hybrid-trading-engine"
+primary_region = "sin"   # Singapore — closest to India
+
+[build]
+  [build.args]
+    PYTHON_VERSION = "3.11"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https   = true
+  auto_stop_machines   = false   # IMPORTANT: keep running 24/7
+  auto_start_machines  = true
+  min_machines_running = 1       # always 1 instance
+
+  [http_service.concurrency]
+    type       = "requests"
+    hard_limit = 200
+    soft_limit = 150
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1

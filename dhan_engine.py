@@ -984,31 +984,34 @@ class DhanEngine:
         (deep ITM options, low-liquidity strikes), fetch their last traded price
         via Dhan REST API and populate the price cache.
 
-        This solves the "..." problem for deep ITM CE/PE options.
+        Uses resolve_tokens_to_sids (Path 2) so it works even for tokens
+        that were never explicitly subscribed — just parses the trd_symbol
+        directly to find the Dhan security_id.
+
         Returns the number of prices fetched.
         """
-        if not trds or not self._is_market_open():
+        if not trds:
             return 0
+        # Note: no market_open check — fetch even outside hours for testing
 
-        # Build {seg: [sid]} map for the zero-price tokens
-        by_seg: Dict[str, List[str]] = defaultdict(list)
+        # Use resolve_tokens_to_sids which handles both cached and direct-parse paths
+        by_seg_ws = self._mapper.resolve_tokens_to_sids(trds)
+
+        # Build reverse map: sid → trd for response parsing
         sid_to_trd: Dict[str, str] = {}
+        by_seg: Dict[str, List[str]] = defaultdict(list)
 
-        for trd in trds:
-            sid = self._mapper._trd_to_sid.get(trd)
-            if not sid:
-                continue
-            _, mkey = self._mapper._sid_to_meta.get(sid, (None, None))
-            if not mkey:
-                continue
-            _, seg = self._mapper._key_to_sid.get(mkey, (None, None))
-            if seg:
-                # Map Dhan API segment name back to REST API key
-                rest_seg = seg.replace("NSE_FNO", "NSE_FO").replace("BSE_FNO", "BSE_FO")
-                by_seg[rest_seg].append(sid)
-                sid_to_trd[sid] = trd
+        for seg_ws, sids in by_seg_ws.items():
+            # Convert WS segment name → REST API segment name
+            rest_seg = seg_ws.replace("NSE_FNO", "NSE_FO").replace("BSE_FNO", "BSE_FO")
+            for sid in sids:
+                trd = self._mapper._sid_to_trd.get(sid)
+                if trd:
+                    by_seg[rest_seg].append(sid)
+                    sid_to_trd[sid] = trd
 
         if not by_seg:
+            log.debug(f"[REST LTP] None of {len(trds)} tokens resolved to sids")
             return 0
 
         try:

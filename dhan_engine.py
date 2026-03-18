@@ -552,19 +552,77 @@ class TokenMapper:
     def resolve_tokens_to_sids(
         self, trds: List[str]
     ) -> Dict[str, List[str]]:
-        """Returns {dhan_seg: [sid, ...]} for a list of trd_symbols."""
+        """
+        Returns {dhan_seg: [sid, ...]} for a list of trd_symbols.
+
+        Works in TWO ways:
+        1. Direct lookup in _trd_to_sid (populated by enrich_from_scrip_cache)
+        2. Parse trd_symbol directly from Kotak format → build match key → lookup in CSV
+           This is the PRIMARY path in cloud mode because enrich_from_scrip_cache
+           is never called — the desktop app sends Kotak trd_symbols directly.
+
+        Kotak trd_symbol formats:
+          Weekly : NIFTY2631722500CE   (YY + single-digit-month + DD + strike + OT)
+          Monthly: BANKNIFTY26MAY60000PE (YY + 3-letter-month + strike + OT)
+        """
         result: Dict[str, List[str]] = defaultdict(list)
+        unresolved = []
+
         for trd in trds:
+            # Path 1: pre-built cross-reference (from enrich_from_scrip_cache)
             sid = self._trd_to_sid.get(trd)
-            if not sid:
+            if sid:
+                _, mkey = self._sid_to_meta.get(sid, (None, None))
+                if mkey:
+                    _, seg = self._key_to_sid.get(mkey, (None, None))
+                    if seg:
+                        result[seg].append(sid)
+                        continue
+
+            # Path 2: parse trd_symbol directly → match key → Dhan CSV lookup
+            parsed = _parse_trd_symbol(trd)
+            if not parsed:
+                unresolved.append(trd)
                 continue
-            _, mkey = self._sid_to_meta.get(sid, (None, None))
-            if not mkey:
-                continue
-            _, seg = self._key_to_sid.get(mkey, (None, None))
-            if seg:
+            und, strike, ot, expiry_ymd = parsed
+            mkey = f"{und}|{strike}|{ot}|{expiry_ymd}"
+
+            entry = self._key_to_sid.get(mkey)
+            if not entry:
+                # Try nearest-expiry (±7 days) for monthly contracts
+                entry = self._find_nearest_for_trd(und, strike, ot, expiry_ymd)
+
+            if entry:
+                sid, seg = entry
+                # Cache for future lookups
+                self._trd_to_sid[trd] = sid
+                self._sid_to_trd[sid] = trd
                 result[seg].append(sid)
+            else:
+                unresolved.append(trd)
+
+        if unresolved:
+            log.debug(f"[MAP] {len(unresolved)} trd_symbols unresolved: {unresolved[:3]}")
+
         return dict(result)
+
+    def _find_nearest_for_trd(self, und: str, strike: int, ot: str, expiry_ymd: str):
+        """Find nearest Dhan entry within ±7 days (handles monthly expiry offsets)."""
+        base = f"{und}|{strike}|{ot}"
+        candidates = self._nei.get(base, [])
+        if not candidates:
+            return None
+        try:
+            target_dt = datetime.strptime(expiry_ymd, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+        best_entry, best_delta = None, 8
+        for (dt, sid, seg) in candidates:
+            diff = abs((dt - target_dt).days)
+            if diff < best_delta:
+                best_delta = diff
+                best_entry = (sid, seg)
+        return best_entry
 
     def chain_sids_for(self, symbol: str, expiry: str) -> Dict[str, str]:
         """Return {sid: trd_symbol} for all chain tokens of symbol+expiry."""
@@ -848,22 +906,28 @@ class DhanEngine:
                 await self._broadcast(f"__IDX_{sym}", ltp)
             return
 
-        # Option / equity tokens — look up trd_symbol
+        # Option / equity tokens
+        # Step 1: look up trd_symbol from _sid_to_trd
+        # (populated when subscribe_tokens resolves via Path 2)
         trd = self._mapper.get_trd_by_sid(sid)
-        if not trd:
-            return
 
-        self._prices[trd] = ltp
-        if self._broadcast:
-            await self._broadcast(trd, ltp)
-
-        # Also update by psym
-        for psym, psid in self._mapper._psym_to_sid.items():
-            if psid == sid:
+        if trd:
+            self._prices[trd] = ltp
+            if self._broadcast:
+                await self._broadcast(trd, ltp)
+            # Also update by psym if cross-referenced
+            psym = next(
+                (p for p, s in self._mapper._psym_to_sid.items() if s == sid), None
+            )
+            if psym:
                 self._prices[psym] = ltp
                 if self._broadcast:
                     await self._broadcast(psym, ltp)
-                break
+        else:
+            # Step 2: sid received a tick but not yet in _sid_to_trd
+            # This means the tick arrived before subscribe built the mapping
+            # Store price by sid key so get_ltp(sid) still works as fallback
+            self._prices[f"__SID_{sid}"] = ltp
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -917,17 +981,29 @@ class DhanEngine:
     async def subscribe_tokens(self, trds: List[str]):
         """Subscribe a list of trd_symbols to the live feed."""
         if not self._mapper.csv_loaded:
-            log.warning("[ENGINE] Mapper not ready — tokens queued")
+            log.warning("[ENGINE] Mapper not ready — tokens queued until CSV loads")
+
         by_seg = self._mapper.resolve_tokens_to_sids(trds)
+
+        total_resolved = sum(len(v) for v in by_seg.values())
+        log.info(f"[SUB] Received {len(trds)} trd_symbols → resolved {total_resolved} Dhan sids "
+                 f"(sample: {trds[:2]})")
+
+        if total_resolved == 0 and trds:
+            log.warning(f"[SUB] ⚠ ZERO resolved — mapper may not have these expiries. "
+                        f"Sample unresolved: {trds[:3]}")
+
         for seg, sids in by_seg.items():
             new_sids = [s for s in sids if s not in self._subscribed_sids]
             if not new_sids:
                 continue
             if self._ws_running:
                 await self._flush_sids(new_sids, seg)
+                log.info(f"[SUB] ✓ Subscribed {len(new_sids)} sids on {seg}")
             else:
                 for sid in new_sids:
                     self._pending_sub[sid] = seg
+                log.info(f"[SUB] WS not ready — queued {len(new_sids)} sids for {seg}")
 
     async def unsubscribe_tokens(self, trds: List[str]):
         """Unsubscribe tokens to free up slots."""

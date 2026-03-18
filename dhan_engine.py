@@ -978,6 +978,76 @@ class DhanEngine:
                 result[trd] = ltp
         return result
 
+    async def fetch_zero_price_tokens_rest(self, trds: List[str]) -> int:
+        """
+        For tokens that have been subscribed but never received a WebSocket tick
+        (deep ITM options, low-liquidity strikes), fetch their last traded price
+        via Dhan REST API and populate the price cache.
+
+        This solves the "..." problem for deep ITM CE/PE options.
+        Returns the number of prices fetched.
+        """
+        if not trds or not self._is_market_open():
+            return 0
+
+        # Build {seg: [sid]} map for the zero-price tokens
+        by_seg: Dict[str, List[str]] = defaultdict(list)
+        sid_to_trd: Dict[str, str] = {}
+
+        for trd in trds:
+            sid = self._mapper._trd_to_sid.get(trd)
+            if not sid:
+                continue
+            _, mkey = self._mapper._sid_to_meta.get(sid, (None, None))
+            if not mkey:
+                continue
+            _, seg = self._mapper._key_to_sid.get(mkey, (None, None))
+            if seg:
+                # Map Dhan API segment name back to REST API key
+                rest_seg = seg.replace("NSE_FNO", "NSE_FO").replace("BSE_FNO", "BSE_FO")
+                by_seg[rest_seg].append(sid)
+                sid_to_trd[sid] = trd
+
+        if not by_seg:
+            return 0
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    DHAN_LTP_URL,
+                    json=dict(by_seg),
+                    headers={
+                        "Content-Type": "application/json",
+                        "client-id"   : self._client_id,
+                        "access-token": self._access_token,
+                    },
+                )
+            if resp.status_code != 200:
+                log.debug(f"[REST LTP] HTTP {resp.status_code}")
+                return 0
+
+            data = resp.json().get("data", {})
+            filled = 0
+            for seg_data in data.values():
+                if not isinstance(seg_data, dict):
+                    continue
+                for sid, info in seg_data.items():
+                    if not isinstance(info, dict):
+                        continue
+                    ltp = float(info.get("last_price", 0) or 0)
+                    if ltp > 0 and sid in sid_to_trd:
+                        trd = sid_to_trd[sid]
+                        self._prices[trd] = ltp
+                        # Also broadcast via SSE so clients get the price
+                        if self._broadcast:
+                            await self._broadcast(trd, ltp)
+                        filled += 1
+            return filled
+
+        except Exception as e:
+            log.debug(f"[REST LTP] Error: {e}")
+            return 0
+
     async def subscribe_tokens(self, trds: List[str]):
         """Subscribe a list of trd_symbols to the live feed."""
         if not self._mapper.csv_loaded:

@@ -178,6 +178,19 @@ async def get_chain(symbol: str, expiry: str):
     return {"symbol": symbol, "expiry": expiry, "chain": chain}
 
 
+@app.post("/ltp/zeros")
+async def fetch_zero_prices(req: SubscribeRequest):
+    """
+    Fetch prices for subscribed tokens that have zero/no price via Dhan REST API.
+    Used for deep ITM options that don't tick frequently on WebSocket.
+    Populates the price cache and broadcasts via SSE.
+    """
+    if not engine:
+        raise HTTPException(503, "Engine starting up")
+    filled = await engine.fetch_zero_price_tokens_rest(req.tokens)
+    return {"filled": filled, "requested": len(req.tokens)}
+
+
 @app.post("/token/refresh")
 async def force_token_refresh(req: TokenRefreshRequest):
     if not engine:

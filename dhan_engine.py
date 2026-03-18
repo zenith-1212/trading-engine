@@ -1025,14 +1025,29 @@ class DhanEngine:
     async def _spot_poll_loop(self):
         """
         Poll Dhan REST for index spot prices every 30s during market hours.
-        If WS index ticks are flowing, REST results are redundant but harmless.
+
+        This is a FALLBACK only — the WebSocket already delivers NIFTY/BANKNIFTY/SENSEX
+        ticks directly via IDX_I subscription. REST is only needed on first startup
+        before the WS delivers its first tick.
+
+        Fix: on 401, refresh token immediately instead of hammering expired token.
+        Skip REST entirely once WS index ticks are flowing (_spot_ok = True).
         """
+        _consecutive_401 = 0
+
         while not self._stop:
             await asyncio.sleep(30)
+
+            # Skip REST if WS is already delivering index ticks — no need to poll
+            if self._spot_ok and self._ws_running:
+                continue
+
             if not self._is_market_open():
                 continue
+
             if time.time() < self._spot_cooldown:
                 continue
+
             try:
                 async with httpx.AsyncClient(timeout=8) as client:
                     resp = await client.post(
@@ -1044,10 +1059,25 @@ class DhanEngine:
                             "access-token": self._access_token,
                         },
                     )
-                if resp.status_code == 429:
-                    self._spot_cooldown = time.time() + 60
-                    log.warning("[SPOT] 429 — pausing REST for 60s")
+
+                if resp.status_code == 401:
+                    _consecutive_401 += 1
+                    log.warning(f"[SPOT] 401 Unauthorized (#{_consecutive_401}) — refreshing token...")
+                    # Refresh token immediately, then stop hammering
+                    await self._do_token_refresh()
+                    self._spot_cooldown = time.time() + 60  # wait 60s after refresh
+                    if _consecutive_401 >= 3:
+                        log.warning("[SPOT] 3 consecutive 401s — disabling REST spot poller. WS handles index prices.")
+                        break  # Stop the loop entirely; WS delivers index ticks anyway
                     continue
+
+                _consecutive_401 = 0  # reset on any non-401
+
+                if resp.status_code == 429:
+                    self._spot_cooldown = time.time() + 120
+                    log.warning("[SPOT] 429 — pausing REST for 120s")
+                    continue
+
                 if resp.status_code == 200:
                     data = resp.json().get("data", {})
                     nse = data.get("NSE_IDX", {})
@@ -1059,6 +1089,8 @@ class DhanEngine:
                         if ltp > 0:
                             self._spot_prices[sym] = ltp
                             self._prices[f"__IDX_{sym}"] = ltp
+                    log.debug(f"[SPOT] REST fallback: {self._spot_prices}")
+
             except Exception as e:
                 log.debug(f"[SPOT] Poll error: {e}")
 

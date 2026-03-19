@@ -991,6 +991,7 @@ class DhanEngine:
             "connected"        : self._ws_running,
             "subscribed_tokens": self.subscribed_count(),
             "price_cache_size" : len(self._prices),
+            "prices_cached"    : len(self._prices),
             "retry_count"      : self._retry_count,
             "rate_limited"     : time.time() < self._429_until,
             "mapper_ready"     : self._mapper.csv_loaded,

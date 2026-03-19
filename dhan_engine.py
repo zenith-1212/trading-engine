@@ -636,6 +636,32 @@ class TokenMapper:
                 result[sid] = trd
         return result
 
+    def _build_trd_list(self, symbol: str, expiry: str) -> List[str]:
+        """
+        Build list of all trd_symbols for symbol+expiry from Dhan CSV.
+        Used by chain endpoint to auto-subscribe all tokens for an expiry.
+        """
+        trds = []
+        for mkey, (sid, seg) in self._key_to_sid.items():
+            parts = mkey.split("|")
+            if len(parts) != 4:
+                continue
+            sym, strike, ot, exp_ymd = parts
+            if sym != symbol or exp_ymd != expiry:
+                continue
+            trd = self._sid_to_trd.get(sid)
+            if not trd:
+                try:
+                    from datetime import datetime as _dt
+                    dt = _dt.strptime(exp_ymd, "%Y-%m-%d")
+                    trd = f"{sym}{dt.year % 100}{dt.month}{dt.day:02d}{strike}{ot}"
+                    self._trd_to_sid[trd] = sid
+                    self._sid_to_trd[sid] = trd
+                except Exception:
+                    continue
+            trds.append(trd)
+        return trds
+
 
 # ── Main DhanEngine class ─────────────────────────────────────────────────────
 
@@ -669,6 +695,12 @@ class DhanEngine:
         self._retry_count        = 0
         self._stop               = False
         self._429_until          = 0.0   # Unix timestamp when 429 cooldown ends
+
+        # Token refresh lock — prevents multiple simultaneous refresh attempts
+        # Dhan blocks if called more than once every 2 minutes ("Invalid TOTP")
+        self._token_refresh_lock  = asyncio.Lock()
+        self._token_refreshing    = False
+        self._token_last_refresh  = 0.0   # Unix timestamp of last successful refresh
 
         # Async broadcast to SSE clients
         self._broadcast          = sse_broadcast_fn
@@ -968,14 +1000,53 @@ class DhanEngine:
     def get_chain_ltps(self, symbol: str, expiry: str) -> dict:
         """
         Return {trd_symbol: ltp} for the option chain of symbol+expiry.
-        trd_symbol format: NIFTY2631722500CE etc.
+
+        Strategy:
+        1. Scan _key_to_sid (Dhan CSV) for all entries matching symbol+expiry
+           Build trd_symbols on the fly from the key parts
+        2. For each sid, check _prices cache — subscribe via WebSocket if missing
+        3. Return all prices found, including any cached from previous ticks
+
+        This works even if no explicit subscribe call was made first.
         """
-        sids = self._mapper.chain_sids_for(symbol, expiry)
         result = {}
-        for sid, trd in sids.items():
-            ltp = self._prices.get(trd)
-            if ltp is not None:
+
+        # Scan _key_to_sid: keys are "SYMBOL|strike|OT|expiry_ymd"
+        for mkey, (sid, seg) in self._mapper._key_to_sid.items():
+            parts = mkey.split("|")
+            if len(parts) != 4:
+                continue
+            sym, strike, ot, exp_ymd = parts
+            if sym != symbol or exp_ymd != expiry:
+                continue
+
+            # Get or build trd_symbol for this entry
+            trd = self._mapper._sid_to_trd.get(sid)
+            if not trd:
+                # Build Kotak-style trd_symbol from components
+                # expiry_ymd = "2026-03-19" → parse date → weekly format
+                try:
+                    from datetime import datetime as _dt
+                    dt = _dt.strptime(exp_ymd, "%Y-%m-%d")
+                    # Weekly: NIFTY{YY}{M}{DD}{strike}{OT}
+                    mo = dt.month  # single digit 1-12
+                    trd = f"{sym}{dt.year % 100}{mo}{dt.day:02d}{strike}{ot}"
+                    self._mapper._trd_to_sid[trd] = sid
+                    self._mapper._sid_to_trd[sid] = trd
+                except Exception:
+                    continue
+
+            # Check price cache by trd_symbol
+            ltp = self._prices.get(trd, 0.0)
+
+            # Also check by sid key (some ticks stored as __SID_{sid})
+            if ltp <= 0:
+                ltp = self._prices.get(f"__SID_{sid}", 0.0)
+
+            # Include in result (even 0 so web knows the token exists)
+            if ltp > 0:
                 result[trd] = ltp
+
         return result
 
     async def fetch_zero_price_tokens_rest(self, trds: List[str]) -> int:
@@ -1102,14 +1173,46 @@ class DhanEngine:
     # ── Internal token refresh ─────────────────────────────────────────────────
 
     async def _do_token_refresh(self) -> bool:
-        new_token = await refresh_dhan_token(
-            self._client_id, self._pin, self._totp_secret
-        )
-        if new_token:
-            self._access_token = new_token
-            log.info("[TOKEN] ✓ Token refreshed")
-            return True
-        return False
+        """
+        Locked token refresh — only ONE refresh runs at a time.
+        Prevents "Invalid TOTP" / "Token can be generated once every 2 minutes"
+        errors caused by multiple coroutines calling refresh simultaneously.
+        """
+        # Already refreshed recently (within 110s — under Dhan's 2-min limit)
+        if time.time() - self._token_last_refresh < 110:
+            log.debug("[TOKEN] Skipping refresh — done recently")
+            return bool(self._access_token)
+
+        # If another coroutine is already refreshing, wait for it
+        if self._token_refreshing:
+            log.info("[TOKEN] Refresh already in progress — waiting...")
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                if not self._token_refreshing:
+                    break
+            return bool(self._access_token)
+
+        # Acquire lock — only one coroutine proceeds
+        async with self._token_refresh_lock:
+            # Double-check after acquiring lock
+            if time.time() - self._token_last_refresh < 110:
+                log.debug("[TOKEN] Skipping — another coroutine just refreshed")
+                return bool(self._access_token)
+
+            self._token_refreshing = True
+            try:
+                new_token = await refresh_dhan_token(
+                    self._client_id, self._pin, self._totp_secret
+                )
+                if new_token:
+                    self._access_token = new_token
+                    self._token_last_refresh = time.time()
+                    log.info("[TOKEN] ✓ Token refreshed")
+                    return True
+                log.warning("[TOKEN] Refresh failed — will retry next cycle")
+                return False
+            finally:
+                self._token_refreshing = False
 
     async def _daily_refresh_loop(self):
         """

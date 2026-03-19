@@ -174,8 +174,22 @@ async def unsubscribe(req: SubscribeRequest):
 async def get_chain(symbol: str, expiry: str):
     if not engine:
         raise HTTPException(503, "Engine starting up")
-    chain = engine.get_chain_ltps(symbol.upper(), expiry)
-    return {"symbol": symbol, "expiry": expiry, "chain": chain}
+
+    sym = symbol.upper()
+    chain = engine.get_chain_ltps(sym, expiry)
+
+    # Auto-subscribe all tokens for this expiry to Dhan WebSocket
+    # so future calls return live LTPs instead of 0
+    if chain is not None:
+        all_trds = list(engine._mapper._build_trd_list(sym, expiry))
+        if all_trds:
+            await engine.subscribe_tokens(all_trds)
+            # Fetch via REST for any still-zero tokens (deep ITM, low liquidity)
+            zero_trds = [t for t in all_trds if engine._prices.get(t, 0) <= 0]
+            if zero_trds:
+                asyncio.create_task(engine.fetch_zero_price_tokens_rest(zero_trds[:100]))
+
+    return {"symbol": sym, "expiry": expiry, "chain": chain or {}}
 
 
 @app.post("/ltp/zeros")
@@ -197,6 +211,113 @@ async def force_token_refresh(req: TokenRefreshRequest):
         raise HTTPException(503, "Engine starting up")
     success = await engine.refresh_dhan_token(force=req.force)
     return {"success": success}
+
+
+@app.get("/token/refresh")
+async def refresh_token_browser(key: str = ""):
+    """
+    Browser-accessible token refresh — open URL in any browser.
+    URL: https://your-engine.railway.app/token/refresh?key=refresh123
+    Set TOKEN_REFRESH_KEY env var on Railway to change the secret key.
+    """
+    import os
+    from fastapi.responses import HTMLResponse
+    expected = os.getenv("TOKEN_REFRESH_KEY", "refresh123")
+
+    if key != expected:
+        return HTMLResponse("""
+<html><body style="font-family:sans-serif;padding:40px;background:#111;color:#fff">
+<h2>🔒 Token Refresh</h2>
+<p>Add <code style="background:#222;padding:4px 8px;border-radius:4px">?key=YOUR_KEY</code> to the URL</p>
+<p style="color:#888">Default key: <code>refresh123</code><br>
+Set <code>TOKEN_REFRESH_KEY</code> env var on Railway to change it.</p>
+</body></html>""", status_code=401)
+
+    if not engine:
+        return HTMLResponse("<html><body style='background:#111;color:#fff;padding:40px'>Engine not ready</body></html>", status_code=503)
+
+    log.info("[TOKEN] Manual browser refresh triggered")
+    success = await engine._do_token_refresh()
+    status  = engine.status()
+    color   = "#00ff88" if success else "#ff4444"
+    icon    = "✓" if success else "✗"
+    ws_ok   = status.get("ws_connected", False)
+
+    return HTMLResponse(f"""
+<html><body style="font-family:sans-serif;padding:40px;background:#111;color:#fff">
+<h2 style="color:{color}">{icon} Token Refresh {"Successful" if success else "Failed"}</h2>
+<table style="border-collapse:collapse;margin-top:20px;min-width:300px">
+  <tr><td style="padding:8px 16px 8px 0;color:#888">WS Status</td>
+      <td style="padding:8px;color:{"#00ff88" if ws_ok else "#ff4444"}">
+      {"● Connected" if ws_ok else "○ Disconnected"}</td></tr>
+  <tr><td style="padding:8px 16px 8px 0;color:#888">Subscribed Tokens</td>
+      <td style="padding:8px">{status.get("subscribed_tokens", 0)}</td></tr>
+  <tr><td style="padding:8px 16px 8px 0;color:#888">Prices Cached</td>
+      <td style="padding:8px">{status.get("prices_cached", 0)}</td></tr>
+</table>
+<p style="margin-top:30px">
+  <a href="/token/refresh?key={key}" style="color:#4af;margin-right:20px">↻ Refresh Again</a>
+  <a href="/health" style="color:#4af;margin-right:20px">Health</a>
+  <a href="/status" style="color:#4af">Status</a>
+</p>
+<p style="color:#555;font-size:12px;margin-top:20px">
+  Bookmark this URL: /token/refresh?key={key}
+</p>
+</body></html>""")
+
+
+@app.get("/token/refresh")
+async def refresh_token_browser(key: str = ""):
+    """
+    Browser-accessible token refresh.
+    Open in browser: https://your-engine.railway.app/token/refresh?key=refresh123
+    Protected by simple secret key (set TOKEN_REFRESH_KEY env var on Railway,
+    default is 'refresh123').
+    """
+    import os
+    expected = os.getenv("TOKEN_REFRESH_KEY", "refresh123")
+    if key != expected:
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse("""
+        <html><body style="font-family:sans-serif;padding:40px;background:#111;color:#fff">
+        <h2>🔒 Token Refresh</h2>
+        <p>Add <code>?key=YOUR_SECRET_KEY</code> to the URL</p>
+        <p style="color:#888">Set TOKEN_REFRESH_KEY environment variable on Railway to change the key.<br>
+        Default key is: <code>refresh123</code></p>
+        </body></html>""", status_code=401)
+
+    if not engine:
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse("<html><body>Engine not ready</body></html>", status_code=503)
+
+    log.info("[TOKEN] Manual browser refresh requested")
+    success = await engine._do_token_refresh()
+
+    from fastapi.responses import HTMLResponse
+    status = engine.status()
+    color  = "#00ff88" if success else "#ff4444"
+    icon   = "✓" if success else "✗"
+    return HTMLResponse(f"""
+    <html><body style="font-family:sans-serif;padding:40px;background:#111;color:#fff">
+    <h2 style="color:{color}">{icon} Token Refresh {'Successful' if success else 'Failed'}</h2>
+    <table style="border-collapse:collapse;margin-top:20px">
+      <tr><td style="padding:8px;color:#888">WS Connected</td>
+          <td style="padding:8px;color:{("#00ff88" if status.get("ws_connected") else "#ff4444")}">
+          {"● Connected" if status.get("ws_connected") else "○ Disconnected"}</td></tr>
+      <tr><td style="padding:8px;color:#888">Subscribed Tokens</td>
+          <td style="padding:8px">{status.get("subscribed_tokens", 0)}</td></tr>
+      <tr><td style="padding:8px;color:#888">Prices Cached</td>
+          <td style="padding:8px">{status.get("prices_cached", 0)}</td></tr>
+    </table>
+    <p style="margin-top:30px;color:#888">
+      <a href="/token/refresh?key={key}" style="color:#4af">↻ Refresh Again</a>
+      &nbsp;|&nbsp;
+      <a href="/health" style="color:#4af">Health Check</a>
+      &nbsp;|&nbsp;
+      <a href="/status" style="color:#4af">Full Status</a>
+    </p>
+    <p style="color:#555;font-size:12px">Bookmark this URL to refresh token from anywhere</p>
+    </body></html>""")
 
 
 @app.get("/stream")

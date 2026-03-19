@@ -238,7 +238,7 @@ Set <code>TOKEN_REFRESH_KEY</code> env var on Railway to change it.</p>
 
     log.info("[TOKEN] Manual browser refresh triggered")
     success = await engine._do_token_refresh()
-    status  = engine.status()
+    status  = engine.get_status()
     color   = "#00ff88" if success else "#ff4444"
     icon    = "✓" if success else "✗"
     ws_ok   = status.get("ws_connected", False)
@@ -294,7 +294,7 @@ async def refresh_token_browser(key: str = ""):
     success = await engine._do_token_refresh()
 
     from fastapi.responses import HTMLResponse
-    status = engine.status()
+    status  = engine.get_status()
     color  = "#00ff88" if success else "#ff4444"
     icon   = "✓" if success else "✗"
     return HTMLResponse(f"""

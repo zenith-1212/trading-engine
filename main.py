@@ -176,18 +176,31 @@ async def get_chain(symbol: str, expiry: str):
         raise HTTPException(503, "Engine starting up")
 
     sym = symbol.upper()
-    chain = engine.get_chain_ltps(sym, expiry)
 
-    # Auto-subscribe all tokens for this expiry to Dhan WebSocket
-    # so future calls return live LTPs instead of 0
-    if chain is not None:
-        all_trds = list(engine._mapper._build_trd_list(sym, expiry))
-        if all_trds:
-            await engine.subscribe_tokens(all_trds)
-            # Fetch via REST for any still-zero tokens (deep ITM, low liquidity)
-            zero_trds = [t for t in all_trds if engine._prices.get(t, 0) <= 0]
-            if zero_trds:
-                asyncio.create_task(engine.fetch_zero_price_tokens_rest(zero_trds[:100]))
+    # Build full token list for this expiry from Dhan CSV
+    all_trds = list(engine._mapper._build_trd_list(sym, expiry))
+
+    # Subscribe ALL tokens to Dhan WebSocket for live updates
+    if all_trds:
+        await engine.subscribe_tokens(all_trds)
+
+    # Fetch prices via REST for tokens with no WS tick yet
+    # This covers: first load, after-hours, deep ITM low-liquidity strikes
+    # Batch in groups of 500 (Dhan REST limit) and await the first batch
+    # so this request returns real prices immediately
+    zero_trds = [t for t in all_trds if engine._prices.get(t, 0) <= 0]
+    if zero_trds:
+        # First batch: await so caller gets real prices right away
+        first_batch = zero_trds[:500]
+        await engine.fetch_zero_price_tokens_rest(first_batch)
+        # Remaining batches: background tasks
+        for i in range(500, len(zero_trds), 500):
+            asyncio.create_task(
+                engine.fetch_zero_price_tokens_rest(zero_trds[i:i+500])
+            )
+
+    # Now read the price cache — populated by subscribe + REST above
+    chain = engine.get_chain_ltps(sym, expiry)
 
     return {"symbol": sym, "expiry": expiry, "chain": chain or {}}
 
@@ -266,58 +279,7 @@ Set <code>TOKEN_REFRESH_KEY</code> env var on Railway to change it.</p>
 </body></html>""")
 
 
-@app.get("/token/refresh")
-async def refresh_token_browser(key: str = ""):
-    """
-    Browser-accessible token refresh.
-    Open in browser: https://your-engine.railway.app/token/refresh?key=refresh123
-    Protected by simple secret key (set TOKEN_REFRESH_KEY env var on Railway,
-    default is 'refresh123').
-    """
-    import os
-    expected = os.getenv("TOKEN_REFRESH_KEY", "refresh123")
-    if key != expected:
-        from fastapi.responses import HTMLResponse
-        return HTMLResponse("""
-        <html><body style="font-family:sans-serif;padding:40px;background:#111;color:#fff">
-        <h2>🔒 Token Refresh</h2>
-        <p>Add <code>?key=YOUR_SECRET_KEY</code> to the URL</p>
-        <p style="color:#888">Set TOKEN_REFRESH_KEY environment variable on Railway to change the key.<br>
-        Default key is: <code>refresh123</code></p>
-        </body></html>""", status_code=401)
 
-    if not engine:
-        from fastapi.responses import HTMLResponse
-        return HTMLResponse("<html><body>Engine not ready</body></html>", status_code=503)
-
-    log.info("[TOKEN] Manual browser refresh requested")
-    success = await engine._do_token_refresh()
-
-    from fastapi.responses import HTMLResponse
-    status  = engine.get_status()
-    color  = "#00ff88" if success else "#ff4444"
-    icon   = "✓" if success else "✗"
-    return HTMLResponse(f"""
-    <html><body style="font-family:sans-serif;padding:40px;background:#111;color:#fff">
-    <h2 style="color:{color}">{icon} Token Refresh {'Successful' if success else 'Failed'}</h2>
-    <table style="border-collapse:collapse;margin-top:20px">
-      <tr><td style="padding:8px;color:#888">WS Connected</td>
-          <td style="padding:8px;color:{("#00ff88" if status.get("ws_connected") else "#ff4444")}">
-          {"● Connected" if status.get("ws_connected") else "○ Disconnected"}</td></tr>
-      <tr><td style="padding:8px;color:#888">Subscribed Tokens</td>
-          <td style="padding:8px">{status.get("subscribed_tokens", 0)}</td></tr>
-      <tr><td style="padding:8px;color:#888">Prices Cached</td>
-          <td style="padding:8px">{status.get("prices_cached", 0)}</td></tr>
-    </table>
-    <p style="margin-top:30px;color:#888">
-      <a href="/token/refresh?key={key}" style="color:#4af">↻ Refresh Again</a>
-      &nbsp;|&nbsp;
-      <a href="/health" style="color:#4af">Health Check</a>
-      &nbsp;|&nbsp;
-      <a href="/status" style="color:#4af">Full Status</a>
-    </p>
-    <p style="color:#555;font-size:12px">Bookmark this URL to refresh token from anywhere</p>
-    </body></html>""")
 
 
 @app.get("/stream")
